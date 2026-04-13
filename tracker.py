@@ -1,12 +1,11 @@
 """
 MOPS Tracker — 公開資訊觀測站重大訊息追蹤機器人
-每次執行掃描四類公司最新公告，過濾已見過的，
-用 Gemma 摘要後推播到 Telegram。
+資料來源：鉅亨網 (cnyes.com) — 彙整 MOPS 重大訊息，可從雲端 IP 存取
 
 環境變數（GitHub Secrets）:
   TELEGRAM_BOT_TOKEN  — Telegram bot token
   TELEGRAM_CHAT_ID    — 目標 chat/channel ID
-  GEMINI_API_KEY      — Google AI Studio API key（可用 Gemma 模型）
+  GEMINI_API_KEY      — Google AI Studio API key
 """
 
 import json
@@ -14,7 +13,6 @@ import os
 import time
 
 import requests
-from bs4 import BeautifulSoup
 from google import genai
 from google.genai import types
 
@@ -26,26 +24,22 @@ GEMINI_API_KEY     = os.environ["GEMINI_API_KEY"]
 SEEN_IDS_FILE = "seen_ids.json"
 MAX_SEEN_IDS  = 10000
 
-COMPANY_TYPES = {
-    "sii":  "上市公司",
-    "otc":  "上櫃公司",
-    "rotc": "興櫃公司",
-    "pub":  "公開發行公司",
-}
+# 鉅亨網新聞分類 → 公司類型標籤對照
+# tw_material = 重大訊息 (上市/上櫃)
+# shop        = 興櫃
+CNYES_CATEGORIES = [
+    ("tw_material", "重大訊息"),
+    ("tw_announcement", "公告"),
+]
 
-MOPS_BASE = "https://mops.twse.com.tw"
-LIST_URL  = f"{MOPS_BASE}/mops/web/ajax_t05sr01"
+CNYES_BASE = "https://news.cnyes.com"
+CNYES_NEWS = f"{CNYES_BASE}/api/v3/news/category"
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Referer":         "https://mops.twse.com.tw/mops/web/index",
-    "Origin":          "https://mops.twse.com.tw",
-    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+    "User-Agent":  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept":      "application/json, text/plain, */*",
+    "Referer":     "https://news.cnyes.com/",
+    "Origin":      "https://news.cnyes.com",
 }
 
 # ─── Seen IDs ─────────────────────────────────────────────────────────────────
@@ -64,131 +58,84 @@ def save_seen(seen: set) -> None:
         json.dump(lst, f, ensure_ascii=False)
 
 
-# ─── MOPS Fetch & Parse ───────────────────────────────────────────────────────
-def get_session() -> requests.Session:
-    """建立帶有 MOPS session cookie 的 requests.Session。"""
-    session = requests.Session()
-    session.headers.update(HEADERS)
+# ─── cnyes.com 抓取 ───────────────────────────────────────────────────────────
+def fetch_cnyes(category: str, minutes_back: int = 6) -> list[dict]:
+    """
+    抓取鉅亨網最近 N 分鐘的台股公告新聞。
+    回傳 raw item 列表。
+    """
+    now      = int(time.time())
+    start_ts = now - (minutes_back * 60)
+
+    url    = f"{CNYES_NEWS}/{category}"
+    params = {"startAt": start_ts, "endAt": now, "limit": 30}
+
     try:
-        session.get(f"{MOPS_BASE}/mops/web/index", timeout=15)
-    except Exception:
-        pass
-    return session
+        r = requests.get(url, headers=HEADERS, params=params, timeout=30)
+        print(f"  [{category}] HTTP {r.status_code}, url={r.url}")
 
+        if r.status_code != 200:
+            print(f"  [{category}] error body: {r.text[:200]}")
+            return []
 
-def fetch_list(session: requests.Session, typek: str) -> str:
-    payload = {
-        "encodeURIComponent": "1",
-        "step":     "1",
-        "firstin":  "1",
-        "off":      "1",
-        "keyword4": "",
-        "code1":    "",
-        "TYPEK":    typek,
-        "year":     "",
-        "month":    "",
-        "day":      "",
-        "seq_no":   "",
-        "b_date":   "",
-        "e_date":   "",
-        "id":       "",
-        "KEY_WORD": "",
-    }
-    try:
-        r = session.post(LIST_URL, data=payload, timeout=30)
-        r.encoding = "utf-8"
-        html = r.text
+        data = r.json()
+        # 回應結構：{"items": {"data": [...], "total": N}}
+        items = (data.get("items") or {}).get("data") or []
+        print(f"  [{category}] got {len(items)} items")
+        return items
 
-        # 偵測是否被擋
-        if "PAGE CANNOT BE ACCESSED" in html:
-            print(f"[{typek}] ❌ MOPS 封鎖此 IP（security error）")
-            print(f"[{typek}] HTML preview: {html[:300]}")
-            return ""
-
-        return html
     except Exception as e:
-        print(f"[{typek}] fetch error: {e}")
-        return ""
+        print(f"  [{category}] fetch error: {e}")
+        return []
 
 
-def _clean(tag) -> str:
-    return tag.get_text(" ", strip=True) if tag else ""
-
-
-def parse_list(html: str, typek: str) -> list[dict]:
-    items = []
-    if not html:
-        return items
-
-    soup = BeautifulSoup(html, "lxml")
-
-    # 印出前 300 字幫助診斷（只在找不到表格時）
-    table = soup.find("table", class_=lambda c: c and "hasBorder" in c)
-    if not table:
-        tables = soup.find_all("table")
-        table = max(tables, key=lambda t: len(t.find_all("tr")), default=None)
-    if not table:
-        print(f"[{typek}] no table found. HTML preview: {html[:300]}")
-        return items
-
-    rows = table.find_all("tr")
-    for row in rows[1:]:
-        cols = row.find_all("td")
-        if len(cols) < 4:
-            continue
+def parse_cnyes(raw_items: list[dict], category_label: str) -> list[dict]:
+    """將鉅亨網的 raw item 轉成統一格式。"""
+    result = []
+    for item in raw_items:
         try:
-            date     = _clean(cols[0])
-            time_s   = _clean(cols[1]) if len(cols) > 1 else ""
-            code     = _clean(cols[2]) if len(cols) > 2 else ""
-            name     = _clean(cols[3]) if len(cols) > 3 else ""
-            title_td = cols[4] if len(cols) > 4 else cols[3]
-            title    = _clean(title_td)
+            news_id   = str(item.get("newsId") or item.get("_id") or "")
+            title     = item.get("title", "").strip()
+            publish_at = item.get("publishAt", 0)          # Unix timestamp
+            url       = item.get("url") or f"{CNYES_BASE}/news/id/{news_id}"
+            summary   = item.get("summary") or item.get("body") or ""
 
-            if not date or not code:
+            # 股票資訊（可能是 list）
+            stocks    = item.get("stocks") or []
+            if stocks:
+                stock  = stocks[0]
+                code   = str(stock.get("symbol") or stock.get("stockId") or "")
+                name   = stock.get("name") or ""
+            else:
+                code, name = "", ""
+
+            # 過濾沒有標題的項目
+            if not title or not news_id:
                 continue
 
-            a    = title_td.find("a") or row.find("a")
-            href = a["href"] if a and a.get("href") else ""
-            if href and not href.startswith("http"):
-                href = MOPS_BASE + href if href.startswith("/") else f"{MOPS_BASE}/mops/web/{href}"
+            # 格式化時間
+            t        = time.localtime(publish_at)
+            date_str = time.strftime("%Y/%m/%d", t)
+            time_str = time.strftime("%H:%M", t)
 
-            items.append({
-                "id":         f"{typek}_{date}_{time_s}_{code}",
-                "date":       date,
-                "time":       time_s,
+            result.append({
+                "id":         f"cnyes_{news_id}",
+                "date":       date_str,
+                "time":       time_str,
                 "code":       code,
-                "name":       name,
+                "name":       name if name else title[:10],
                 "title":      title,
-                "link":       href,
-                "typek":      typek,
-                "type_label": COMPANY_TYPES[typek],
+                "link":       url if url.startswith("http") else CNYES_BASE + url,
+                "summary":    summary[:1000],   # 鉅亨有時直接提供摘要
+                "type_label": category_label,
             })
         except Exception as e:
-            print(f"[{typek}] parse row error: {e}")
+            print(f"  parse error: {e}, item={str(item)[:100]}")
 
-    return items
-
-
-def fetch_content(session: requests.Session, url: str) -> str:
-    if not url:
-        return ""
-    try:
-        r = session.get(url, timeout=30)
-        r.encoding = "utf-8"
-        soup = BeautifulSoup(r.text, "lxml")
-        for tag in soup(["script", "style", "nav", "header", "footer"]):
-            tag.decompose()
-        for selector in ["pre", ".content", "#content", "article"]:
-            el = soup.select_one(selector)
-            if el:
-                return el.get_text("\n", strip=True)[:3000]
-        return soup.get_text("\n", strip=True)[:3000]
-    except Exception as e:
-        print(f"content fetch error ({url}): {e}")
-        return ""
+    return result
 
 
-# ─── Gemma / Gemini Summarize（新版 google-genai SDK）────────────────────────
+# ─── Gemma / Gemini 摘要 ──────────────────────────────────────────────────────
 PREFERRED_MODELS = ["gemma-3-12b-it", "gemma-3-4b-it", "gemini-2.0-flash"]
 
 def summarize(title: str, content: str, name: str, type_label: str) -> str:
@@ -205,11 +152,11 @@ def summarize(title: str, content: str, name: str, type_label: str) -> str:
             resp = client.models.generate_content(
                 model=model_name,
                 contents=prompt,
-                config=types.GenerateContentConfig(max_output_tokens=512),
+                config=types.GenerateContentConfig(max_output_tokens=400),
             )
             return resp.text.strip()
         except Exception as e:
-            print(f"[{model_name}] error: {e}, trying next...")
+            print(f"  [{model_name}] error: {e}")
     return "（摘要暫不可用）"
 
 
@@ -230,16 +177,16 @@ def send_tg(text: str) -> None:
         )
         r.raise_for_status()
     except Exception as e:
-        print(f"telegram error: {e}")
+        print(f"  telegram error: {e}")
 
 
 def fmt_msg(ann: dict, summary: str) -> str:
-    tag  = ann["type_label"].replace("公司", "")
-    link = ann["link"] or f"{MOPS_BASE}/mops/#/web/home"
+    code_part = f"（{ann['code']}）" if ann["code"] else ""
+    link      = ann["link"]
     return (
         f"📢 <b>{ann['title']}</b>\n\n"
-        f"🏢 {ann['name']}（{ann['code']}）\n"
-        f"🏷 #{tag}\n"
+        f"🏢 {ann['name']}{code_part}\n"
+        f"🏷 #{ann['type_label']}\n"
         f"⏰ {ann['date']} {ann['time']}\n\n"
         f"{summary}\n\n"
         f'🔗 <a href="{link}">查看原文</a>'
@@ -250,13 +197,12 @@ def fmt_msg(ann: dict, summary: str) -> str:
 def main() -> None:
     seen      = load_seen()
     new_count = 0
-    session   = get_session()
 
-    for typek, label in COMPANY_TYPES.items():
-        print(f"Checking {label}…")
-        html  = fetch_list(session, typek)
-        items = parse_list(html, typek)
-        print(f"  {len(items)} announcements fetched")
+    for category, label in CNYES_CATEGORIES:
+        print(f"Checking {label} ({category})…")
+        raw   = fetch_cnyes(category)
+        items = parse_cnyes(raw, label)
+        print(f"  {len(items)} announcements parsed")
 
         for ann in items:
             if ann["id"] in seen:
@@ -266,8 +212,13 @@ def main() -> None:
             seen.add(ann["id"])
             new_count += 1
 
-            content = fetch_content(session, ann["link"])
-            summary = summarize(ann["title"], content, ann["name"], ann["type_label"])
+            # 如果鉅亨已有摘要就直接用，否則才呼叫 Gemma
+            content = ann.get("summary") or ""
+            if len(content) < 50:
+                summary = summarize(ann["title"], content, ann["name"], ann["type_label"])
+            else:
+                summary = "📋 " + content
+
             send_tg(fmt_msg(ann, summary))
             time.sleep(1.5)
 
