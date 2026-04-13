@@ -1,0 +1,48 @@
+name: MOPS Tracker
+
+on:
+  schedule:
+    # 每 5 分鐘執行一次（UTC 時間，GitHub 實際觸發可能有 ±5 min 誤差）
+    - cron: "*/5 * * * *"
+  # 也可手動從 Actions 頁面觸發
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 需要寫入權限才能 commit seen_ids.json
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4    # 避免 job 卡住消耗 minutes
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 使用 PAT 以便後續 push（若用預設 GITHUB_TOKEN 需確認 repo 設定允許）
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tracker
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY:     ${{ secrets.GEMINI_API_KEY }}
+        run: python tracker.py
+
+      - name: Commit updated seen_ids.json
+        run: |
+          git config user.name  "MOPS Bot"
+          git config user.email "actions@github.com"
+          git add seen_ids.json
+          # 只有有變化才 commit；[skip ci] 避免觸發新的 workflow
+          git diff --staged --quiet || git commit -m "chore: update seen_ids [skip ci]"
+          git push
